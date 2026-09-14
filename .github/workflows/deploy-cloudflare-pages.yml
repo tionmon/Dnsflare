@@ -1,0 +1,100 @@
+name: Deploy Cloudflare Pages
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cloudflare-pages-production
+  cancel-in-progress: true
+
+env:
+  PROJECT_NAME: dnsflare-tionmon
+  CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+  CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+  CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
+  DNSFLARE_API_KEY: ${{ secrets.DNSFLARE_API_KEY }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Validate secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=0
+          for name in CLOUDFLARE_API_TOKEN CLOUDFLARE_ACCOUNT_ID CF_API_TOKEN DNSFLARE_API_KEY; do
+            if [ -z "${!name:-}" ]; then
+              echo "::error::Missing GitHub Actions secret: ${name}"
+              missing=1
+            fi
+          done
+          exit "$missing"
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Build
+        run: npm run build
+
+      - name: Ensure Pages project exists
+        shell: bash
+        run: |
+          set -euo pipefail
+          if npx -y wrangler@4 pages project list --json | node -e '
+            let input = "";
+            process.stdin.on("data", chunk => input += chunk);
+            process.stdin.on("end", () => {
+              const data = JSON.parse(input);
+              const projects = Array.isArray(data) ? data : (data.result || []);
+              process.exit(projects.some(project => project.name === process.env.PROJECT_NAME) ? 0 : 1);
+            });
+          '; then
+            echo "Pages project ${PROJECT_NAME} already exists."
+          else
+            npx -y wrangler@4 pages project create "$PROJECT_NAME" --production-branch master
+          fi
+
+      - name: Upload Pages runtime secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          trap 'rm -f .pages-secrets.json' EXIT
+          node <<'NODE'
+          const fs = require('fs');
+          fs.writeFileSync('.pages-secrets.json', JSON.stringify({
+            CF_API_TOKEN: process.env.CF_API_TOKEN,
+            DNSFLARE_API_KEY: process.env.DNSFLARE_API_KEY,
+          }));
+          NODE
+          npx -y wrangler@4 pages secret bulk .pages-secrets.json --project-name "$PROJECT_NAME"
+
+      - name: Deploy production
+        shell: bash
+        run: |
+          set -euo pipefail
+          npx -y wrangler@4 pages deploy dist \
+            --project-name "$PROJECT_NAME" \
+            --branch master \
+            --commit-hash "$GITHUB_SHA"
+
+      - name: Show deployment URL
+        if: success()
+        run: |
+          echo "Production URL: https://${PROJECT_NAME}.pages.dev"
